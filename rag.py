@@ -77,13 +77,20 @@ class RAGChatbot:
         missing_vars = []
         
         for var in required_vars:
-            if not os.getenv(var):
+            api_key = os.getenv(var)
+            if not api_key:
                 missing_vars.append(var)
+                logger.error(f"Missing environment variable: {var}")
+            else:
+                # Show API key status (first 10 chars for debugging)
+                key_preview = api_key[:10] + "..." if len(api_key) > 10 else api_key
+                logger.info(f"API Key found: {var} = {key_preview} (length: {len(api_key)})")
         
         if missing_vars:
             logger.error(f"Missing required environment variables: {missing_vars}")
             logger.info("Please set the following environment variables:")
             logger.info("export GOOGLE_API_KEY='your_google_api_key_here'")
+            logger.info("Or create a .env file with: GOOGLE_API_KEY=your_key_here")
             raise ValueError(f"Environment variables {missing_vars} are required")
         
         # Use FAISS as vector store (simpler and doesn't require external service)
@@ -178,13 +185,17 @@ class RAGChatbot:
     def setup_embeddings(self):
         """Initialize Google Generative AI embeddings"""
         try:
+            api_key = os.getenv('GOOGLE_API_KEY')
+            logger.info(f"Setting up embeddings with API key: {api_key[:10] if api_key else 'None'}...")
+            
             self.embeddings = GoogleGenerativeAIEmbeddings(
                 model="models/embedding-001",
-                google_api_key=os.getenv('GOOGLE_API_KEY')
+                google_api_key=api_key
             )
             logger.info("Embeddings initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing embeddings: {str(e)}")
+            logger.error("This might be due to an invalid or missing API key")
             raise
     
     def create_vector_store(self, documents: List[Document]):
@@ -233,6 +244,9 @@ class RAGChatbot:
             
         try:
             # Initialize the LLM
+            api_key = os.getenv('GOOGLE_API_KEY')
+            logger.info(f"Setting up LLM with API key: {api_key[:10] if api_key else 'None'}...")
+            
             llm = ChatGoogleGenerativeAI(
                 model="gemini-2.0-flash",  # Updated model name
                 google_api_key=os.getenv('GOOGLE_API_KEY'),
@@ -307,6 +321,39 @@ class RAGChatbot:
             logger.error(f"Error in chat: {str(e)}")
             raise
     
+    def test_api_key(self):
+        """Test if the API key is valid by making a simple request"""
+        try:
+            api_key = os.getenv('GOOGLE_API_KEY')
+            if not api_key:
+                logger.error("No API key found")
+                return False
+                
+            logger.info("Testing API key with Google Generative AI...")
+            
+            # Test embeddings
+            test_embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key=api_key
+            )
+            test_result = test_embeddings.embed_query("test")
+            logger.info(f"Embeddings test successful: {len(test_result)} dimensions")
+            
+            # Test LLM
+            test_llm = ChatGoogleGenerativeAI(
+                model="gemini-2.0-flash",
+                google_api_key=api_key,
+                temperature=0.1
+            )
+            test_response = test_llm.invoke("Say 'API key is working'")
+            logger.info(f"LLM test successful: {test_response.content}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"API key test failed: {str(e)}")
+            return False
+    
     def initialize_from_path(self, file_path: str):
         """Initialize the chatbot with documents from a path"""
         try:
@@ -351,6 +398,14 @@ async def startup_event():
     """Initialize chatbot on startup"""
     logger.info(f"Attempting to initialize with document: {DOCUMENT_PATH}")
     logger.info(f"File exists: {os.path.exists(DOCUMENT_PATH)}")
+    
+    # Test API key first
+    logger.info("Testing API key...")
+    api_key_test = chatbot.test_api_key()
+    if not api_key_test:
+        logger.error("API key test failed! Please check your GOOGLE_API_KEY")
+        return
+    
     try:
         # Auto-initialize with the document path if it exists
         if DOCUMENT_PATH and os.path.exists(DOCUMENT_PATH):
@@ -423,6 +478,22 @@ async def upload_documents(files: List[UploadFile] = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.get("/test-api-key")
+async def test_api_key():
+    """Test if the API key is working"""
+    try:
+        success = chatbot.test_api_key()
+        return {
+            "api_key_test": "success" if success else "failed",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "api_key_test": "failed",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 
 @app.get("/health")
 async def health_check():
