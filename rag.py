@@ -41,7 +41,7 @@ except ImportError:
     pass
 
 # SET YOUR DOCUMENT PATH HERE
-DOCUMENT_PATH = "CHOTGDP23004V012223.pdf"  # ← CHANGE THIS TO YOUR ACTUAL PATH
+DOCUMENT_PATH = "policy.pdf"  # ← CHANGE THIS TO YOUR ACTUAL PATH
 
 # Pydantic models
 class ChatRequest(BaseModel):
@@ -234,7 +234,7 @@ class RAGChatbot:
         try:
             # Initialize the LLM
             llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",  # Updated model name
+                model="gemini-2.0-flash",  # Updated model name
                 google_api_key=os.getenv('GOOGLE_API_KEY'),
                 temperature=0.7
             )

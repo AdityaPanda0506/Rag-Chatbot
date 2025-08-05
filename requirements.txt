@@ -1,0 +1,32 @@
+# Core web framework and API
+fastapi
+uvicorn[standard]
+python-multipart
+
+# CORS middleware
+python-dotenv
+
+# LangChain and AI/ML dependencies
+langchain
+langchain-google-genai
+langchain-community
+
+# Vector store and embeddings
+faiss-cpu
+
+# Document processing
+pypdf
+unstructured[email]
+
+# HTTP client for chat client
+requests
+
+# Data validation and serialization
+pydantic
+
+# Async support
+asyncio
+
+# Logging and utilities
+typing-extensions
+pathlib
