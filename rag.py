@@ -18,19 +18,23 @@ from pydantic_settings import BaseSettings
 # LangChain imports - Updated for latest versions
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain_community.document_loaders import (
-    PyPDFLoader, 
     DirectoryLoader,
     TextLoader,
     UnstructuredEmailLoader
 )
 
+# PDF processing with pdfplumber
+import pdfplumber
+
 # Additional imports
 import shutil
+import pickle
+import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,9 +49,9 @@ except ImportError:
 
 # Settings class for environment variables
 class Settings(BaseSettings):
-    google_api_key: str = ""
+    openai_api_key: str = ""
     pinecone_api_key: str = ""
-    api_bearer_token: str = ""
+    api_bearer_token: str = "test_token_123"
     
     class Config:
         env_file = ".env"
@@ -96,16 +100,20 @@ class RAGChatbot:
         self.vector_store = None
         self.qa_chain = None
         self.sessions = {}  # Store conversation memories
+        self.cache_dir = "vector_cache"  # Directory to store cached embeddings
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
             length_function=len,
         )
         
+        # Create cache directory if it doesn't exist
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
     def setup_environment(self):
         """Setup environment variables and API keys"""
         # Check for required environment variables
-        required_vars = ['GOOGLE_API_KEY']
+        required_vars = ['OPENAI_API_KEY']
         missing_vars = []
         
         for var in required_vars:
@@ -121,8 +129,8 @@ class RAGChatbot:
         if missing_vars:
             logger.error(f"Missing required environment variables: {missing_vars}")
             logger.info("Please set the following environment variables:")
-            logger.info("export GOOGLE_API_KEY='your_google_api_key_here'")
-            logger.info("Or create a .env file with: GOOGLE_API_KEY=your_key_here")
+            logger.info("export OPENAI_API_KEY='your_openai_api_key_here'")
+            logger.info("Or create a .env file with: OPENAI_API_KEY=your_key_here")
             raise ValueError(f"Environment variables {missing_vars} are required")
         
         # Use FAISS as vector store (simpler and doesn't require external service)
@@ -180,10 +188,27 @@ class RAGChatbot:
         
         try:
             if extension == '.pdf':
-                logger.info(f"Loading PDF file: {file_path}")
-                loader = PyPDFLoader(str(file_path))
-                documents = loader.load()
+                logger.info(f"Loading PDF file with pdfplumber: {file_path}")
+                documents = []
+                with pdfplumber.open(str(file_path)) as pdf:
+                    for page_num, page in enumerate(pdf.pages):
+                        text = page.extract_text()
+                        if text and text.strip():
+                            # Create document with metadata
+                            doc = Document(
+                                page_content=text,
+                                metadata={
+                                    "source": str(file_path),
+                                    "page": page_num + 1,
+                                    "total_pages": len(pdf.pages)
+                                }
+                            )
+                            documents.append(doc)
+                            logger.info(f"Extracted text from page {page_num + 1}")
+                
+                logger.info(f"Successfully loaded {len(documents)} pages from PDF")
                 return documents
+                
             elif extension in ['.txt', '.md']:
                 loader = TextLoader(str(file_path), encoding='utf-8')
             elif extension == '.eml':
@@ -201,9 +226,16 @@ class RAGChatbot:
         """Load all supported files from a directory"""
         documents = []
         
-        # Define file patterns for different loaders
+        # Load PDF files with pdfplumber
+        pdf_files = list(dir_path.glob("*.pdf"))
+        for pdf_file in pdf_files:
+            try:
+                documents.extend(self._load_single_file(pdf_file))
+            except Exception as e:
+                logger.error(f"Error loading PDF file {pdf_file}: {str(e)}")
+        
+        # Load other file types with DirectoryLoader
         patterns = {
-            "*.pdf": PyPDFLoader,
             "*.txt": TextLoader,
             "*.md": TextLoader,
             "*.eml": UnstructuredEmailLoader,
@@ -243,14 +275,13 @@ class RAGChatbot:
         return chunks
     
     def setup_embeddings(self):
-        """Initialize Google Generative AI embeddings"""
+        """Initialize OpenAI embeddings"""
         try:
-            api_key = settings.google_api_key or os.getenv('GOOGLE_API_KEY')
+            api_key = settings.openai_api_key or os.getenv('OPENAI_API_KEY')
             logger.info(f"Setting up embeddings with API key: {api_key[:10] if api_key else 'None'}...")
             
-            self.embeddings = GoogleGenerativeAIEmbeddings(
-                model="models/embedding-001",
-                google_api_key=api_key
+            self.embeddings = OpenAIEmbeddings(
+                openai_api_key=api_key
             )
             logger.info("Embeddings initialized successfully")
         except Exception as e:
@@ -275,6 +306,87 @@ class RAGChatbot:
             logger.error(f"Error creating vector store: {str(e)}")
             raise
     
+    def generate_cache_key(self, document_url: str) -> str:
+        """Generate a unique cache key for a document URL"""
+        return hashlib.md5(document_url.encode()).hexdigest()
+    
+    def get_cache_path(self, cache_key: str) -> str:
+        """Get the cache file path for a given cache key"""
+        return os.path.join(self.cache_dir, f"{cache_key}.pkl")
+    
+    def save_vector_store_to_cache(self, cache_key: str):
+        """Save the current vector store to cache"""
+        if not self.vector_store:
+            logger.warning("No vector store to save")
+            return
+            
+        try:
+            cache_path = self.get_cache_path(cache_key)
+            # Save FAISS index
+            self.vector_store.save_local(cache_path)
+            logger.info(f"Vector store saved to cache: {cache_path}")
+        except Exception as e:
+            logger.error(f"Error saving vector store to cache: {str(e)}")
+    
+    def load_vector_store_from_cache(self, cache_key: str) -> bool:
+        """Load vector store from cache if it exists"""
+        try:
+            cache_path = self.get_cache_path(cache_key)
+            if not os.path.exists(cache_path):
+                logger.info(f"Cache not found for key: {cache_key}")
+                return False
+                
+            if not self.embeddings:
+                self.setup_embeddings()
+                
+            # Load FAISS index
+            self.vector_store = FAISS.load_local(cache_path, self.embeddings)
+            logger.info(f"Vector store loaded from cache: {cache_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading vector store from cache: {str(e)}")
+            return False
+    
+    def clear_cache(self):
+        """Clear all cached vector stores"""
+        try:
+            if os.path.exists(self.cache_dir):
+                for file in os.listdir(self.cache_dir):
+                    if file.endswith('.pkl'):
+                        os.remove(os.path.join(self.cache_dir, file))
+                logger.info("Cache cleared successfully")
+        except Exception as e:
+            logger.error(f"Error clearing cache: {str(e)}")
+    
+    def get_cache_info(self) -> Dict[str, Any]:
+        """Get information about cached files"""
+        try:
+            cache_files = []
+            total_size = 0
+            if os.path.exists(self.cache_dir):
+                for file in os.listdir(self.cache_dir):
+                    if file.endswith('.pkl'):
+                        file_path = os.path.join(self.cache_dir, file)
+                        file_size = os.path.getsize(file_path)
+                        cache_files.append({
+                            "file": file,
+                            "size_bytes": file_size,
+                            "size_mb": round(file_size / (1024 * 1024), 2)
+                        })
+                        total_size += file_size
+            
+            return {
+                "cache_directory": self.cache_dir,
+                "total_files": len(cache_files),
+                "total_size_bytes": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2),
+                "files": cache_files
+            }
+        except Exception as e:
+            logger.error(f"Error getting cache info: {str(e)}")
+            return {"error": str(e)}
+    
     def setup_qa_chain(self):
         """Setup the conversational retrieval chain"""
         if not self.vector_store:
@@ -282,12 +394,12 @@ class RAGChatbot:
             
         try:
             # Initialize the LLM
-            api_key = settings.google_api_key or os.getenv('GOOGLE_API_KEY')
+            api_key = settings.openai_api_key or os.getenv('OPENAI_API_KEY')
             logger.info(f"Setting up LLM with API key: {api_key[:10] if api_key else 'None'}...")
             
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-flash",  # Updated model name
-                google_api_key=api_key,
+            llm = ChatOpenAI(
+                model="gpt-4o-mini",  # Using OpenAI's latest model
+                openai_api_key=api_key,
                 temperature=0.3  # Lower temperature for more consistent answers
             )
             
@@ -383,25 +495,24 @@ class RAGChatbot:
     def test_api_key(self):
         """Test if the API key is valid by making a simple request"""
         try:
-            api_key = settings.google_api_key or os.getenv('GOOGLE_API_KEY')
+            api_key = settings.openai_api_key or os.getenv('OPENAI_API_KEY')
             if not api_key:
                 logger.error("No API key found")
                 return False
                 
-            logger.info("Testing API key with Google Generative AI...")
+            logger.info("Testing API key with OpenAI...")
             
             # Test embeddings
-            test_embeddings = GoogleGenerativeAIEmbeddings(
-                model="models/embedding-001",
-                google_api_key=api_key
+            test_embeddings = OpenAIEmbeddings(
+                openai_api_key=api_key
             )
             test_result = test_embeddings.embed_query("test")
             logger.info(f"Embeddings test successful: {len(test_result)} dimensions")
             
             # Test LLM
-            test_llm = ChatGoogleGenerativeAI(
-                model="gemini-2.0-flash",
-                google_api_key=api_key,
+            test_llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                openai_api_key=api_key,
                 temperature=0.1
             )
             test_response = test_llm.invoke("Say 'API key is working'")
@@ -440,6 +551,19 @@ class RAGChatbot:
         try:
             logger.info(f"Initializing chatbot with document from URL: {document_url}")
             
+            # Generate cache key for this document URL
+            cache_key = self.generate_cache_key(document_url)
+            logger.info(f"Cache key: {cache_key}")
+            
+            # Try to load from cache first
+            if self.load_vector_store_from_cache(cache_key):
+                logger.info("Successfully loaded vector store from cache")
+                self.setup_qa_chain()
+                logger.info("RAG Chatbot initialized successfully from cache")
+                return
+            
+            logger.info("Cache miss - processing document from scratch")
+            
             # Download document
             temp_file_path = self.download_document_from_url(document_url)
             
@@ -451,9 +575,12 @@ class RAGChatbot:
             processed_docs = self.process_documents(documents)
             self.create_vector_store(processed_docs)
             
+            # Save to cache for future use
+            self.save_vector_store_to_cache(cache_key)
+            
             # Setup QA chain
             self.setup_qa_chain()
-            logger.info("RAG Chatbot initialized successfully from URL")
+            logger.info("RAG Chatbot initialized successfully from URL and cached")
             
         except Exception as e:
             logger.error(f"Error initializing chatbot from URL: {str(e)}")
@@ -494,11 +621,11 @@ async def startup_event():
     logger.info("Testing API key...")
     api_key_test = chatbot.test_api_key()
     if not api_key_test:
-        logger.error("API key test failed! Please check your GOOGLE_API_KEY")
+        logger.error("API key test failed! Please check your OPENAI_API_KEY")
     else:
         logger.info("API key test successful!")
 
-@app.post("api/v1/hackrx/run", response_model=HackRXResponse)
+@app.post("/api/v1/hackrx/run", response_model=HackRXResponse)
 async def hackrx_run(request: HackRXRequest, token: str = Depends(verify_token)):
     """Main HackRX endpoint - process document URL and answer multiple questions"""
     try:
@@ -624,6 +751,17 @@ async def delete_session(session_id: str, token: str = Depends(verify_token)):
     else:
         raise HTTPException(status_code=404, detail="Session not found")
 
+@app.get("/cache/info")
+async def get_cache_info(token: str = Depends(verify_token)):
+    """Get information about cached vector stores"""
+    return chatbot.get_cache_info()
+
+@app.delete("/cache/clear")
+async def clear_cache(token: str = Depends(verify_token)):
+    """Clear all cached vector stores"""
+    chatbot.clear_cache()
+    return {"message": "Cache cleared successfully"}
+
 if __name__ == "__main__":
     import uvicorn
     import argparse
@@ -631,12 +769,12 @@ if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='HackRX RAG Chatbot API')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on')
-    parser.add_argument('--port', type=int, default=8000, help='Port to run on')
+    parser.add_argument('--port', type=int, default=8001, help='Port to run on')
     args = parser.parse_args()
     
     print(f"Starting HackRX RAG Chatbot API...")
     print(f"Using FAISS as vector store")
-    print(f"Make sure to set your GOOGLE_API_KEY environment variable")
+    print(f"Make sure to set your OPENAI_API_KEY environment variable")
     print(f"Main endpoint: POST /hackrx/run")
     
     uvicorn.run(app, host=args.host, port=args.port)
