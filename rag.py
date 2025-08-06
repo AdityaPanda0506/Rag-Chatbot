@@ -4,11 +4,16 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 import logging
 from datetime import datetime
+import requests
+import tempfile
+import uuid
 
 # FastAPI imports
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+from pydantic_settings import BaseSettings
 
 # LangChain imports - Updated for latest versions
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -25,9 +30,7 @@ from langchain_community.document_loaders import (
 )
 
 # Additional imports
-import tempfile
 import shutil
-import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,10 +43,39 @@ try:
 except ImportError:
     pass
 
-# SET YOUR DOCUMENT PATH HERE
-DOCUMENT_PATH = "policy.pdf"  # ← CHANGE THIS TO YOUR ACTUAL PATH
+# Settings class for environment variables
+class Settings(BaseSettings):
+    google_api_key: str = ""
+    pinecone_api_key: str = ""
+    api_bearer_token: str = ""
+    
+    class Config:
+        env_file = ".env"
 
-# Pydantic models
+settings = Settings()
+
+# Security
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify bearer token"""
+    if credentials.credentials != settings.api_bearer_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
+
+# Pydantic models for the new API format
+class HackRXRequest(BaseModel):
+    documents: str  # URL to the document
+    questions: List[str]  # List of questions to answer
+
+class HackRXResponse(BaseModel):
+    answers: List[str]  # List of answers corresponding to the questions
+
+# Original Pydantic models (keeping for backward compatibility)
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
@@ -77,7 +109,7 @@ class RAGChatbot:
         missing_vars = []
         
         for var in required_vars:
-            api_key = os.getenv(var)
+            api_key = getattr(settings, var.lower(), None) or os.getenv(var)
             if not api_key:
                 missing_vars.append(var)
                 logger.error(f"Missing environment variable: {var}")
@@ -96,6 +128,33 @@ class RAGChatbot:
         # Use FAISS as vector store (simpler and doesn't require external service)
         self.use_pinecone = False
         logger.info("Using FAISS as vector store")
+
+    def download_document_from_url(self, url: str) -> str:
+        """Download document from URL and return local path"""
+        try:
+            logger.info(f"Downloading document from: {url}")
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            
+            # Create temporary file
+            temp_dir = tempfile.mkdtemp()
+            file_extension = ".pdf"  # Assuming PDF for now
+            if url.lower().endswith('.txt'):
+                file_extension = ".txt"
+            elif url.lower().endswith('.md'):
+                file_extension = ".md"
+            
+            temp_file_path = os.path.join(temp_dir, f"document{file_extension}")
+            
+            with open(temp_file_path, 'wb') as f:
+                f.write(response.content)
+            
+            logger.info(f"Document downloaded successfully to: {temp_file_path}")
+            return temp_file_path
+            
+        except Exception as e:
+            logger.error(f"Error downloading document: {str(e)}")
+            raise
             
     def load_documents_from_path(self, file_path: str) -> List[Document]:
         """Load documents from a given file or directory path"""
@@ -124,6 +183,7 @@ class RAGChatbot:
                 logger.info(f"Loading PDF file: {file_path}")
                 loader = PyPDFLoader(str(file_path))
                 documents = loader.load()
+                return documents
             elif extension in ['.txt', '.md']:
                 loader = TextLoader(str(file_path), encoding='utf-8')
             elif extension == '.eml':
@@ -185,7 +245,7 @@ class RAGChatbot:
     def setup_embeddings(self):
         """Initialize Google Generative AI embeddings"""
         try:
-            api_key = os.getenv('GOOGLE_API_KEY')
+            api_key = settings.google_api_key or os.getenv('GOOGLE_API_KEY')
             logger.info(f"Setting up embeddings with API key: {api_key[:10] if api_key else 'None'}...")
             
             self.embeddings = GoogleGenerativeAIEmbeddings(
@@ -209,33 +269,11 @@ class RAGChatbot:
         try:
             # Use FAISS for simplicity
             self.vector_store = FAISS.from_documents(documents, self.embeddings)
-            # Save FAISS index locally
-            self.vector_store.save_local("faiss_index")
-            logger.info("FAISS vector store created and saved successfully")
+            logger.info("FAISS vector store created successfully")
                 
         except Exception as e:
             logger.error(f"Error creating vector store: {str(e)}")
             raise
-    
-    def load_existing_vector_store(self):
-        """Load existing vector store if available"""
-        try:
-            if not self.embeddings:
-                self.setup_embeddings()
-            if Path("faiss_index").exists():
-                self.vector_store = FAISS.load_local(
-                    "faiss_index", 
-                    self.embeddings,
-                    allow_dangerous_deserialization=True  # Required for newer versions
-                )
-                logger.info("Loaded existing FAISS vector store")
-                return True
-            else:
-                logger.info("No existing FAISS index found")
-                return False
-        except Exception as e:
-            logger.error(f"Error loading FAISS vector store: {str(e)}")
-            return False
     
     def setup_qa_chain(self):
         """Setup the conversational retrieval chain"""
@@ -244,13 +282,13 @@ class RAGChatbot:
             
         try:
             # Initialize the LLM
-            api_key = os.getenv('GOOGLE_API_KEY')
+            api_key = settings.google_api_key or os.getenv('GOOGLE_API_KEY')
             logger.info(f"Setting up LLM with API key: {api_key[:10] if api_key else 'None'}...")
             
             llm = ChatGoogleGenerativeAI(
                 model="gemini-2.0-flash",  # Updated model name
-                google_api_key=os.getenv('GOOGLE_API_KEY'),
-                temperature=0.7
+                google_api_key=api_key,
+                temperature=0.3  # Lower temperature for more consistent answers
             )
             
             # Create retriever
@@ -320,11 +358,32 @@ class RAGChatbot:
         except Exception as e:
             logger.error(f"Error in chat: {str(e)}")
             raise
+
+    async def answer_question(self, question: str) -> str:
+        """Answer a single question without session management"""
+        if not self.qa_chain:
+            raise ValueError("QA chain not initialized")
+            
+        try:
+            # Get response from the chain without memory
+            result = await asyncio.to_thread(
+                self.qa_chain,
+                {
+                    "question": question,
+                    "chat_history": []  # Empty chat history for standalone questions
+                }
+            )
+            
+            return result["answer"]
+            
+        except Exception as e:
+            logger.error(f"Error answering question: {str(e)}")
+            raise
     
     def test_api_key(self):
         """Test if the API key is valid by making a simple request"""
         try:
-            api_key = os.getenv('GOOGLE_API_KEY')
+            api_key = settings.google_api_key or os.getenv('GOOGLE_API_KEY')
             if not api_key:
                 logger.error("No API key found")
                 return False
@@ -359,16 +418,13 @@ class RAGChatbot:
         try:
             logger.info(f"Initializing chatbot with documents from: {file_path}")
             
-            # Try to load existing vector store first
-            if not self.load_existing_vector_store():
-                logger.info("No existing vector store found, creating new one...")
-                # Load and process documents
-                documents = self.load_documents_from_path(file_path)
-                if not documents:
-                    raise ValueError("No documents found in the specified path")
-                
-                processed_docs = self.process_documents(documents)
-                self.create_vector_store(processed_docs)
+            # Load and process documents
+            documents = self.load_documents_from_path(file_path)
+            if not documents:
+                raise ValueError("No documents found in the specified path")
+            
+            processed_docs = self.process_documents(documents)
+            self.create_vector_store(processed_docs)
             
             # Setup QA chain
             self.setup_qa_chain()
@@ -378,8 +434,44 @@ class RAGChatbot:
             logger.error(f"Error initializing chatbot: {str(e)}")
             raise
 
+    async def initialize_from_url(self, document_url: str):
+        """Initialize the chatbot with documents from a URL"""
+        temp_file_path = None
+        try:
+            logger.info(f"Initializing chatbot with document from URL: {document_url}")
+            
+            # Download document
+            temp_file_path = self.download_document_from_url(document_url)
+            
+            # Load and process documents
+            documents = self.load_documents_from_path(temp_file_path)
+            if not documents:
+                raise ValueError("No documents found in the downloaded file")
+            
+            processed_docs = self.process_documents(documents)
+            self.create_vector_store(processed_docs)
+            
+            # Setup QA chain
+            self.setup_qa_chain()
+            logger.info("RAG Chatbot initialized successfully from URL")
+            
+        except Exception as e:
+            logger.error(f"Error initializing chatbot from URL: {str(e)}")
+            raise
+        finally:
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                    # Also remove the temporary directory
+                    temp_dir = os.path.dirname(temp_file_path)
+                    if os.path.exists(temp_dir):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temporary file: {e}")
+
 # Initialize FastAPI app
-app = FastAPI(title="RAG Chatbot API", version="1.0.0")
+app = FastAPI(title="HackRX RAG Chatbot API", version="1.0.0")
 
 # Add CORS middleware
 app.add_middleware(
@@ -395,30 +487,49 @@ chatbot = RAGChatbot()
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize chatbot on startup"""
-    logger.info(f"Attempting to initialize with document: {DOCUMENT_PATH}")
-    logger.info(f"File exists: {os.path.exists(DOCUMENT_PATH)}")
+    """Initialize on startup"""
+    logger.info("HackRX RAG Chatbot API starting up...")
     
     # Test API key first
     logger.info("Testing API key...")
     api_key_test = chatbot.test_api_key()
     if not api_key_test:
         logger.error("API key test failed! Please check your GOOGLE_API_KEY")
-        return
-    
-    try:
-        # Auto-initialize with the document path if it exists
-        if DOCUMENT_PATH and os.path.exists(DOCUMENT_PATH):
-            chatbot.initialize_from_path(DOCUMENT_PATH)
-            logger.info(f"Chatbot auto-initialized with documents from {DOCUMENT_PATH}")
-        else:
-            logger.warning(f"Document path {DOCUMENT_PATH} not found. Use /initialize endpoint to set document path")
-    except Exception as e:
-        logger.error(f"Auto-initialization failed: {str(e)}")
-        logger.info("Use /initialize endpoint to manually set document path")
+    else:
+        logger.info("API key test successful!")
 
+@app.post("api/v1/hackrx/run", response_model=HackRXResponse)
+async def hackrx_run(request: HackRXRequest, token: str = Depends(verify_token)):
+    """Main HackRX endpoint - process document URL and answer multiple questions"""
+    try:
+        logger.info(f"Processing HackRX request with {len(request.questions)} questions")
+        logger.info(f"Document URL: {request.documents}")
+        
+        # Initialize chatbot with the document from URL
+        await chatbot.initialize_from_url(request.documents)
+        
+        # Process all questions
+        answers = []
+        for i, question in enumerate(request.questions):
+            logger.info(f"Processing question {i+1}/{len(request.questions)}: {question}")
+            try:
+                answer = await chatbot.answer_question(question)
+                answers.append(answer)
+                logger.info(f"Answer {i+1}: {answer[:100]}...")  # Log first 100 chars
+            except Exception as e:
+                logger.error(f"Error answering question {i+1}: {str(e)}")
+                answers.append(f"Error processing question: {str(e)}")
+        
+        logger.info(f"Completed processing all {len(request.questions)} questions")
+        return HackRXResponse(answers=answers)
+        
+    except Exception as e:
+        logger.error(f"HackRX processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+# Keep original endpoints for backward compatibility
 @app.post("/initialize", response_model=Dict[str, str])
-async def initialize_chatbot(file_path: str = Form(...)):
+async def initialize_chatbot(file_path: str = Form(...), token: str = Depends(verify_token)):
     """Initialize the chatbot with documents from a specified path"""
     try:
         chatbot.initialize_from_path(file_path)
@@ -427,7 +538,7 @@ async def initialize_chatbot(file_path: str = Form(...)):
         raise HTTPException(status_code=500, detail=f"Initialization failed: {str(e)}")
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, token: str = Depends(verify_token)):
     """Chat with the RAG bot"""
     try:
         if not chatbot.qa_chain:
@@ -439,7 +550,7 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
 @app.post("/upload", response_model=DocumentUploadResponse)
-async def upload_documents(files: List[UploadFile] = File(...)):
+async def upload_documents(files: List[UploadFile] = File(...), token: str = Depends(verify_token)):
     """Upload and process new documents"""
     try:
         processed_files = []
@@ -462,7 +573,6 @@ async def upload_documents(files: List[UploadFile] = File(...)):
                 if chatbot.vector_store:
                     new_vector_store = FAISS.from_documents(processed_docs, chatbot.embeddings)
                     chatbot.vector_store.merge_from(new_vector_store)
-                    chatbot.vector_store.save_local("faiss_index")
                 else:
                     chatbot.create_vector_store(processed_docs)
                     chatbot.setup_qa_chain()
@@ -502,13 +612,11 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "initialized": chatbot.qa_chain is not None,
-        "vector_store_type": "FAISS",
-        "document_path": DOCUMENT_PATH,
-        "document_exists": os.path.exists(DOCUMENT_PATH) if DOCUMENT_PATH else False
+        "vector_store_type": "FAISS"
     }
 
 @app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, token: str = Depends(verify_token)):
     """Delete a chat session"""
     if session_id in chatbot.sessions:
         del chatbot.sessions[session_id]
@@ -521,19 +629,14 @@ if __name__ == "__main__":
     import argparse
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description='RAG Chatbot API')
-    parser.add_argument('--docs-path', type=str, help='Path to documents directory')
+    parser = argparse.ArgumentParser(description='HackRX RAG Chatbot API')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to run on')
     parser.add_argument('--port', type=int, default=8000, help='Port to run on')
     args = parser.parse_args()
     
-    # Override document path if provided via command line
-    if args.docs_path:
-        DOCUMENT_PATH = args.docs_path
-    
-    print(f"Starting RAG Chatbot API...")
-    print(f"Document path: {DOCUMENT_PATH}")
+    print(f"Starting HackRX RAG Chatbot API...")
     print(f"Using FAISS as vector store")
     print(f"Make sure to set your GOOGLE_API_KEY environment variable")
+    print(f"Main endpoint: POST /hackrx/run")
     
     uvicorn.run(app, host=args.host, port=args.port)

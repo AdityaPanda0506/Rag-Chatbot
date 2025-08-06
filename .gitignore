@@ -1,0 +1,4 @@
+.vercel
+myEnv/
+__pycache__/
+.env
